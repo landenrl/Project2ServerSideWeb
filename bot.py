@@ -99,32 +99,46 @@ async def report(ctx, match_id: int, result: str):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
 
-    # Check if the match exists and if the user is part of it
-    print("test")
-    c.execute('SELECT player1_id, player2_id FROM matches WHERE match_id = ?', (match_id,))
-    match = c.fetchone()
-    if match and user.id in match:
-        if result.lower() not in ['w', 'l']:
-            await ctx.send(f'Invalid result. Please report with "w" for win or "l" for loss.')
-            conn.close()
+    try:
+        # Check if the match exists and if the user is part of it
+        c.execute('SELECT player1_id, player2_id FROM matches WHERE match_id = ?', (match_id,))
+        match = c.fetchone()
+        if not match:
+            await ctx.send(f'Match ID {match_id} does not exist.')
             return
 
+        if user.id not in match:
+            await ctx.send(f'You are not a participant in Match ID {match_id}.')
+            return
+
+        # Validate the result
+        if result.lower() not in ['w', 'l']:
+            await ctx.send('Invalid result. Please report with "w" for win or "l" for loss.')
+            return
+
+        # Determine winner and loser
         winner_id = user.id if result.lower() == 'w' else (match[0] if match[1] == user.id else match[1])
         loser_id = match[0] if winner_id == match[1] else match[1]
 
-        # Update user stats for winner and loser
+        # Update match result in the database
+        c.execute('UPDATE matches SET winner_id = ? WHERE match_id = ?', (winner_id, match_id))
+
+        # Update stats for winner
         c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (winner_id,))
-        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (loser_id,))
         c.execute('UPDATE user_stats SET wins = wins + 1 WHERE user_id = ?', (winner_id,))
+
+        # Update stats for loser
+        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (loser_id,))
         c.execute('UPDATE user_stats SET losses = losses + 1 WHERE user_id = ?', (loser_id,))
 
         conn.commit()
+        await ctx.send(f'Match {match_id} has been reported. Winner: {ctx.guild.get_member(winner_id).name}.')
+    except sqlite3.Error as e:
+        print(f"DEBUG: Error updating match result: {e}")
+        await ctx.send('An error occurred while reporting the match.')
+    finally:
         conn.close()
 
-        await ctx.send(f'Match ID {match_id} result confirmed: {ctx.guild.get_member(winner_id).name} wins.')
-    else:
-        await ctx.send(f'Match ID {match_id} not found or you are not part of this match.')
-        conn.close()
 
 @bot.command()
 async def stats(ctx):
@@ -148,47 +162,87 @@ async def delete_match(ctx, match_id: int):
 
     try:
         # Check if the match exists
-        c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,))
+        c.execute('SELECT player1_id, player2_id, winner_id FROM matches WHERE match_id = ?', (match_id,))
         match = c.fetchone()
+
         if not match:
             await ctx.send(f'Match ID {match_id} not found.')
             return
+
+        player1_id, player2_id, winner_id = match
+
+        # Update user stats
+        if winner_id:
+            # Deduct a win for the winner
+            c.execute('UPDATE user_stats SET wins = wins - 1 WHERE user_id = ?', (winner_id,))
+
+            # Determine the loser and deduct a loss
+            loser_id = player1_id if winner_id == player2_id else player2_id
+            c.execute('UPDATE user_stats SET losses = losses - 1 WHERE user_id = ?', (loser_id,))
+        else:
+            # No winner recorded, no stats to adjust
+            await ctx.send(f'Match ID {match_id} had no winner, only the match will be deleted.')
 
         # Delete the match
         c.execute('DELETE FROM matches WHERE match_id = ?', (match_id,))
         conn.commit()
         await ctx.send(f'Match ID {match_id} has been successfully deleted.')
 
-    except Exception as e:
-        await ctx.send(f"An error occurred: {str(e)}")
+    except sqlite3.Error as e:
+        await ctx.send(f"An error occurred while deleting the match: {str(e)}")
     finally:
         conn.close()
+
 
 @bot.command()
 async def alter_winner(ctx, match_id: int, new_winner: discord.Member):
     conn = sqlite3.connect('bot_data.db')
     c = conn.cursor()
 
-    # Check if match exists and the new winner is part of it
-    c.execute('SELECT player1_id, player2_id FROM matches WHERE match_id = ?', (match_id,))
-    match = c.fetchone()
-    if match and new_winner.id in match:
-        current_winner = match[0] if match[1] != new_winner.id else match[1]
-        loser = match[1] if match[0] == new_winner.id else match[0]
+    try:
+        # Fetch match details
+        c.execute('SELECT player1_id, player2_id, winner_id FROM matches WHERE match_id = ?', (match_id,))
+        match = c.fetchone()
 
-        # Update statistics
+        if not match:
+            await ctx.send(f'Match ID {match_id} not found.')
+            return
+
+        player1_id, player2_id, current_winner_id = match
+
+        if new_winner.id not in (player1_id, player2_id):
+            await ctx.send(f'{new_winner.name} is not part of Match ID {match_id}.')
+            return
+
+        # Determine the new loser
+        new_loser_id = player1_id if new_winner.id == player2_id else player2_id
+
+        # Update stats for the current winner (if any)
+        if current_winner_id:
+            c.execute('UPDATE user_stats SET wins = wins - 1 WHERE user_id = ?', (current_winner_id,))
+            current_loser_id = player1_id if current_winner_id == player2_id else player2_id
+            c.execute('UPDATE user_stats SET losses = losses - 1 WHERE user_id = ?', (current_loser_id,))
+
+        # Ensure new winner and loser are in user_stats
         c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (new_winner.id,))
-        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (loser,))
+        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (new_loser_id,))
+
+        # Update stats for the new winner and loser
         c.execute('UPDATE user_stats SET wins = wins + 1 WHERE user_id = ?', (new_winner.id,))
-        c.execute('UPDATE user_stats SET losses = losses + 1 WHERE user_id = ?', (loser,))
-        c.execute('DELETE FROM matches WHERE match_id = ?', (match_id,))
+        c.execute('UPDATE user_stats SET losses = losses + 1 WHERE user_id = ?', (new_loser_id,))
+
+        # Update the match's winner in the database
+        c.execute('UPDATE matches SET winner_id = ? WHERE match_id = ?', (new_winner.id, match_id))
         conn.commit()
+
+        await ctx.send(f'Match ID {match_id} has been updated: {new_winner.name} is now the winner.')
+
+    except sqlite3.Error as e:
+        await ctx.send(f"An error occurred while updating the match: {str(e)}")
+
+    finally:
         conn.close()
 
-        await ctx.send(f'Match ID {match_id} result has been updated: {new_winner.name} is now the winner.')
-    else:
-        await ctx.send(f'{new_winner.name} is not part of Match ID {match_id}.')
-        conn.close()
 
 @bot.command()
 async def leaderboards(ctx):
