@@ -1,11 +1,10 @@
 import discord
-import json
+import sqlite3
 import os
 from discord.ext import commands
 from dotenv import load_dotenv
 
-# token so my account does not get stolen
-load_dotenv
+load_dotenv()
 TOKEN = os.getenv('TOKEN')
 intents = discord.Intents.default()
 intents.messages = True
@@ -15,45 +14,38 @@ intents.members = True
 # Create bot instance
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# Global variables for queue, match data, user statistics, and match ID counter
+# In-memory queue
 queue = []
-matches = {}
-user_stats = {}
-match_id_counter = 1  # Counter to track match IDs
 
-# Load data from JSON file on startup
-def load_data():
-    global matches, user_stats, match_id_counter
-    try:
-        with open('bot_data.json', 'r') as file:
-            data = json.load(file)
-            matches = {int(k): v for k, v in data.get('matches', {}).items()}
-            user_stats = {int(k): v for k, v in data.get('user_stats', {}).items()}
-            match_id_counter = data.get('match_id_counter', 1)
-            print(f"Data loaded successfully. Next match ID: {match_id_counter}")
-    except FileNotFoundError:
-        print("No existing data found. Starting fresh.")
-    except json.JSONDecodeError:
-        print("Error decoding JSON. Starting with empty data.")
-
-# Save data to JSON file
-def save_data():
-    with open('bot_data.json', 'w') as file:
-        data = {
-            'matches': matches,
-            'user_stats': user_stats,
-            'match_id_counter': match_id_counter
-        }
-        json.dump(data, file)
+# Initialize the database and create tables if they do not exist
+def init_db():
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS matches (
+            match_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player1_id INTEGER NOT NULL,
+            player2_id INTEGER NOT NULL,
+            winner_id INTEGER
+        )
+    ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS user_stats (
+            user_id INTEGER PRIMARY KEY,
+            wins INTEGER DEFAULT 0,
+            losses INTEGER DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    conn.close()
 
 @bot.event
 async def on_ready():
-    load_data()  # Load data when the bot starts
+    init_db()  # Initialize the database
     print(f'Bot is online as {bot.user.name}')
 
 @bot.command()
 async def q(ctx):
-    global match_id_counter
     user = ctx.author
     if user.id not in queue:
         queue.append(user.id)
@@ -61,14 +53,36 @@ async def q(ctx):
     else:
         await ctx.send(f'{user.name}, you are already in the queue.')
 
+    # Check if there are enough players to create a match
     if len(queue) >= 2:
         player1 = queue.pop(0)
         player2 = queue.pop(0)
-        matches[match_id_counter] = {'players': [player1, player2], 'reported': {}}
-        await ctx.send(f'Match created! {ctx.guild.get_member(player1).name} vs {ctx.guild.get_member(player2).name}. Match ID: {match_id_counter}')
-        
-        match_id_counter += 1  # Increment match ID for the next match
-        save_data()  # Save updated match data and match ID counter
+        winner = None
+
+        # Debugging: Print player IDs before insertion
+        print(f"DEBUG: Creating match with Player1 ID: {player1}, Player2 ID: {player2}")
+
+        # Insert the new match into the matches table
+        try:
+            conn = sqlite3.connect('bot_data.db')
+            c = conn.cursor()
+            c.execute('INSERT INTO matches (player1_id, player2_id, winner_id) VALUES (?, ?, ?)', (player1, player2, winner))
+            match_id = c.lastrowid  # Retrieve the match ID of the inserted row
+            conn.commit()
+            print(f"DEBUG: Match ID {match_id} created successfully")
+        except sqlite3.Error as e:
+            print(f"DEBUG: Error inserting match into database: {e}")
+            await ctx.send("An error occurred while creating the match.")
+            return
+        finally:
+            conn.close()
+
+        # Notify the players
+        try:
+            await ctx.send(f'Match created! {ctx.guild.get_member(player1).name} vs {ctx.guild.get_member(player2).name}. Match ID: {match_id}')
+        except Exception as e:
+            print(f"DEBUG: Error sending match creation message: {e}")
+
 
 @bot.command()
 async def leave(ctx):
@@ -82,115 +96,130 @@ async def leave(ctx):
 @bot.command()
 async def report(ctx, match_id: int, result: str):
     user = ctx.author
-    if match_id in matches:
-        match = matches[match_id]
-        if user.id in match['players']:
-            if result.lower() not in ['w', 'l']:
-                await ctx.send(f'Invalid result. Please report with "w" for win or "l" for loss.')
-                return
-            
-            if result.lower() == 'w':
-                winner = user.id
-                loser = match['players'][0] if match['players'][0] != winner else match['players'][1]
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
 
-                user_stats.setdefault(winner, {'wins': 0, 'losses': 0})['wins'] += 1
-                user_stats.setdefault(loser, {'wins': 0, 'losses': 0})['losses'] += 1
+    # Check if the match exists and if the user is part of it
+    print("test")
+    c.execute('SELECT player1_id, player2_id FROM matches WHERE match_id = ?', (match_id,))
+    match = c.fetchone()
+    if match and user.id in match:
+        if result.lower() not in ['w', 'l']:
+            await ctx.send(f'Invalid result. Please report with "w" for win or "l" for loss.')
+            conn.close()
+            return
 
-                await ctx.send(f'Match ID {match_id} result confirmed: {user.name} wins.')
-                del matches[match_id]
-                save_data()  # Save updated match data and stats
-            elif result.lower() == 'l':
-                loser = user.id
-                winner = match['players'][0] if match['players'][0] != loser else match['players'][1]
+        winner_id = user.id if result.lower() == 'w' else (match[0] if match[1] == user.id else match[1])
+        loser_id = match[0] if winner_id == match[1] else match[1]
 
-                user_stats.setdefault(winner, {'wins': 0, 'losses': 0})['wins'] += 1
-                user_stats.setdefault(loser, {'wins': 0, 'losses': 0})['losses'] += 1
+        # Update user stats for winner and loser
+        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (winner_id,))
+        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (loser_id,))
+        c.execute('UPDATE user_stats SET wins = wins + 1 WHERE user_id = ?', (winner_id,))
+        c.execute('UPDATE user_stats SET losses = losses + 1 WHERE user_id = ?', (loser_id,))
 
-                await ctx.send(f'Match ID {match_id} result confirmed: {ctx.guild.get_member(winner).name} wins.')
-                del matches[match_id]
-                save_data()  # Save updated match data and stats
-        else:
-            await ctx.send(f'You are not part of Match ID {match_id}.')
+        conn.commit()
+        conn.close()
+
+        await ctx.send(f'Match ID {match_id} result confirmed: {ctx.guild.get_member(winner_id).name} wins.')
     else:
-        await ctx.send(f'Match ID {match_id} not found.')
+        await ctx.send(f'Match ID {match_id} not found or you are not part of this match.')
+        conn.close()
 
 @bot.command()
 async def stats(ctx):
     user = ctx.author
-    if user.id in user_stats:
-        wins = user_stats[user.id]['wins']
-        losses = user_stats[user.id]['losses']
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('SELECT wins, losses FROM user_stats WHERE user_id = ?', (user.id,))
+    stats = c.fetchone()
+    conn.close()
+
+    if stats:
+        wins, losses = stats
         await ctx.send(f'{user.name}, your record: {wins} wins, {losses} losses.')
     else:
         await ctx.send(f'{user.name}, you have no recorded matches yet.')
 
 @bot.command()
 async def delete_match(ctx, match_id: int):
-    if match_id in matches:
-        del matches[match_id]
-        save_data()  # Save updated match data
-        await ctx.send(f'Match ID {match_id} has been deleted.')
-    else:
-        await ctx.send(f'Match ID {match_id} not found.')
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+
+    try:
+        # Check if the match exists
+        c.execute('SELECT * FROM matches WHERE match_id = ?', (match_id,))
+        match = c.fetchone()
+        if not match:
+            await ctx.send(f'Match ID {match_id} not found.')
+            return
+
+        # Delete the match
+        c.execute('DELETE FROM matches WHERE match_id = ?', (match_id,))
+        conn.commit()
+        await ctx.send(f'Match ID {match_id} has been successfully deleted.')
+
+    except Exception as e:
+        await ctx.send(f"An error occurred: {str(e)}")
+    finally:
+        conn.close()
 
 @bot.command()
 async def alter_winner(ctx, match_id: int, new_winner: discord.Member):
-    if match_id in matches:
-        match = matches[match_id]
-        if new_winner.id in match['players']:
-            current_winner = None
-            current_loser = None
-            for player_id in match['players']:
-                if player_id in user_stats and user_stats[player_id]['wins'] > 0:
-                    current_winner = player_id
-                else:
-                    current_loser = player_id
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
 
-            if current_winner and current_loser:
-                user_stats[current_winner]['wins'] -= 1
-                user_stats[current_loser]['losses'] -= 1
+    # Check if match exists and the new winner is part of it
+    c.execute('SELECT player1_id, player2_id FROM matches WHERE match_id = ?', (match_id,))
+    match = c.fetchone()
+    if match and new_winner.id in match:
+        current_winner = match[0] if match[1] != new_winner.id else match[1]
+        loser = match[1] if match[0] == new_winner.id else match[0]
 
-            winner = new_winner.id
-            loser = match['players'][0] if match['players'][0] != winner else match['players'][1]
+        # Update statistics
+        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (new_winner.id,))
+        c.execute('INSERT OR IGNORE INTO user_stats (user_id, wins, losses) VALUES (?, 0, 0)', (loser,))
+        c.execute('UPDATE user_stats SET wins = wins + 1 WHERE user_id = ?', (new_winner.id,))
+        c.execute('UPDATE user_stats SET losses = losses + 1 WHERE user_id = ?', (loser,))
+        c.execute('DELETE FROM matches WHERE match_id = ?', (match_id,))
+        conn.commit()
+        conn.close()
 
-            user_stats.setdefault(winner, {'wins': 0, 'losses': 0})['wins'] += 1
-            user_stats.setdefault(loser, {'wins': 0, 'losses': 0})['losses'] += 1
-
-            await ctx.send(f'Match ID {match_id} result has been updated: {new_winner.name} is now the winner.')
-            del matches[match_id]
-            save_data()  # Save updated user stats and match data
-        else:
-            await ctx.send(f'{new_winner.name} is not part of Match ID {match_id}.')
+        await ctx.send(f'Match ID {match_id} result has been updated: {new_winner.name} is now the winner.')
     else:
-        await ctx.send(f'Match ID {match_id} not found.')
+        await ctx.send(f'{new_winner.name} is not part of Match ID {match_id}.')
+        conn.close()
 
-# Command to display the leaderboard
 @bot.command()
 async def leaderboards(ctx):
-    if not user_stats:
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('SELECT user_id, wins, losses FROM user_stats ORDER BY wins DESC')
+    leaderboard = c.fetchall()
+    conn.close()
+
+    if leaderboard:
+        leaderboard_message = "Leaderboard:\n"
+        for user_id, wins, losses in leaderboard:
+            member = ctx.guild.get_member(user_id)
+            if member:
+                leaderboard_message += f"{member.name}: {wins} wins, {losses} losses\n"
+        await ctx.send(leaderboard_message)
+    else:
         await ctx.send('No match records found.')
-        return
 
-    leaderboard = sorted(user_stats.items(), key=lambda x: x[1]['wins'], reverse=True)
-    leaderboard_message = "Leaderboard:\n"
-    for user_id, stats in leaderboard:
-        member = ctx.guild.get_member(user_id)
-        if member:
-            leaderboard_message += f"{member.name}: {stats['wins']} wins, {stats['losses']} losses\n"
-
-    await ctx.send(leaderboard_message)
-
-# Command to reset all data
 @bot.command()
 async def reset_data(ctx):
-    global matches, user_stats, match_id_counter
-    matches.clear()
-    user_stats.clear()
-    match_id_counter = 1
-    save_data()  # Save cleared data to file
+    conn = sqlite3.connect('bot_data.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM matches')
+    c.execute('DELETE FROM user_stats')
+    c.execute('DELETE FROM sqlite_sequence')
+
+    conn.commit()
+    conn.close()
     await ctx.send('All match data and user statistics have been reset.')
 
-# Command to display all available commands
 @bot.command()
 async def commands(ctx):
     commands_list = (
@@ -208,5 +237,4 @@ async def commands(ctx):
 
 # Run the bot
 bot.run(TOKEN)
-
 
